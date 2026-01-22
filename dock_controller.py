@@ -7,7 +7,7 @@ from custom_msgs.msg import Commands, Telemetry
 import math
 import time
 import numpy as np
-
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 # --- Enum for States ---
 class State:
     SEARCH = 0
@@ -44,7 +44,13 @@ class DockingController(Node):
         # --- ROS Interfaces ---
         self.cmd_pub = self.create_publisher(Commands, "/master/commands", 10)
         
-        self.create_subscription(PoseStamped, "/perception/dock_pose", self.pose_callback, 10)
+        '''self.create_subscription(PoseStamped, "/perception/dock_pose", self.pose_callback, 10)'''
+qos_profile = QoSProfile(
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=10
+)
+self.create_subscription(PoseStamped, "/perception/dock_pose", self.pose_callback, qos_profile)
         self.create_subscription(Telemetry, "/master/telemetry", self.telem_callback, 10)
 
         # Main Control Loop (20Hz)
