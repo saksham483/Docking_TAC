@@ -10,12 +10,12 @@ import numpy as np
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 # --- Enum for States ---
 class State:
-    SEARCH = 0
-    ALIGN_XY = 1
-    ALIGN_YAW = 2
-    APPROACH = 3
-    BLIND_LATCH = 4
-    DOCKED = 5
+    SEARCH = 0  # surges forward with a rpm of 1600 can be changed in search subroutine
+    ALIGN_XY = 1 # align acc to dock's center in the x - y axis 
+    ALIGN_YAW = 2 # align using the yaw only 
+    APPROACH = 3  # descent towards the dock
+    BLIND_LATCH = 4  # when the bot is close enough to the dock 
+    DOCKED = 5 # 
     RECOVERY = 6
 
 class DockingController(Node):
@@ -190,7 +190,7 @@ self.create_subscription(PoseStamped, "/perception/dock_pose", self.pose_callbac
             
         elif self.state == State.RECOVERY:
             # Phase 5b: Retry
-            # Implement the "Up 1m and Back" logic here
+            # going to implement the "Up 1m and Back" logic here 
             pass
 
         self.cmd_pub.publish(cmd)
