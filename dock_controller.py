@@ -15,7 +15,7 @@ class State:
     ALIGN_YAW = 2 # align using the yaw only 
     APPROACH = 3  # descent towards the dock
     BLIND_LATCH = 4  # when the bot is close enough to the dock 
-    DOCKED = 5 # 
+    DOCKED = 5 # will know if puck is connected
     RECOVERY = 6
 
 class DockingController(Node):
@@ -44,7 +44,7 @@ class DockingController(Node):
         # --- ROS Interfaces ---
         self.cmd_pub = self.create_publisher(Commands, "/master/commands", 10)
         
-        '''self.create_subscription(PoseStamped, "/perception/dock_pose", self.pose_callback, 10)'''
+        self.create_subscription(PoseStamped, "dock_pose", self.pose_callback, 10)
 qos_profile = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
@@ -123,7 +123,7 @@ self.create_subscription(PoseStamped, "/perception/dock_pose", self.pose_callbac
             # OR just align XY before moving closer. Let's align XY while slowly creeping.
             
             cmd.lateral = self.apply_pid(err_sway, self.kp_sway)
-            cmd.forward = 1525 # Very slow approach while aligning
+            cmd.forward = 1500 # Very slow approach while aligning
             
             # Check Alignment
             if abs(err_sway) < 0.1: # 10cm threshold
@@ -166,8 +166,8 @@ self.create_subscription(PoseStamped, "/perception/dock_pose", self.pose_callbac
             # Active Approach
             err_sway = self.target_pose['x']
             cmd.lateral = self.apply_pid(err_sway, self.kp_sway)
-            cmd.forward = 1575 # Approach speed
-            
+            #cmd.forward = 1575 # Approach speed
+            cmd.thrust = 1575
         elif self.state == State.BLIND_LATCH:
             # Phase 4b: Blind Push
             elapsed = time.time() - self.blind_timer_start
