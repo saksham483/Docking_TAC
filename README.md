@@ -16,7 +16,7 @@ points to remember before executing the rosref.py
 
 -> there should be a json file with the calibration data named as calibratin_data.json
 
--> docking map size should be cross checke with the existing markermap  
+-> docking map size should be cross checked with the existing markermap  
 
 DEFAULT_MARKER_MAP = {
     28: [ 0.29, -0.49, 0.0],  # Top-Left
