@@ -44,7 +44,7 @@ class DockingController(Node):
         # --- ROS Interfaces ---
         self.cmd_pub = self.create_publisher(Commands, "/master/commands", 10)
         
-        self.create_subscription(PoseStamped, "dock_pose", self.pose_callback, 10)
+        '''self.create_subscription(PoseStamped, "dock_pose", self.pose_callback, 10)'''
 qos_profile = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
     history=HistoryPolicy.KEEP_LAST,
