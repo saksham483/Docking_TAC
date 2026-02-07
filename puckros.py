@@ -3,7 +3,6 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from geometry_msgs.msg import PoseStamped
-from rcl_interfaces.msg import ParameterDescriptor
 
 import cv2
 import cv2.aruco as aruco
@@ -14,19 +13,19 @@ import sys
 from scipy.spatial.transform import Rotation as R, Slerp
 
 # ==========================================
-# 1. HELPER CLASS: POSE FILTERING
+# 1. CLASS: ADAPTIVE POSE FILTER
 # ==========================================
 
-class PoseFilter:
+class AdaptivePoseFilter:
     """
-    Implements an Exponential Moving Average (Low Pass Filter) 
-    to smooth out jittery ArUco detections.
+    Adaptive Low Pass Filter.
+    - High smoothing (low alpha) when robot is stationary (kills jitter).
+    - Low smoothing (high alpha) when robot is moving (kills latency).
     """
-    def __init__(self, alpha_pos=0.7, alpha_rot=0.7):
-        # Alpha 1.0 = No filtering (Raw data)
-        # Alpha 0.1 = Heavy filtering (Slow response, very smooth)
-        self.alpha_pos = alpha_pos
-        self.alpha_rot = alpha_rot
+    def __init__(self, min_alpha=0.1, max_alpha=0.9, ramp_dist=0.05):
+        self.min_alpha = min_alpha  # Heavy smoothing
+        self.max_alpha = max_alpha  # Trust raw data
+        self.ramp_dist = ramp_dist  # Distance (m) to transition between smooth and raw
         self.prev_pos = None
         self.prev_quat = None
 
@@ -36,70 +35,83 @@ class PoseFilter:
             self.prev_quat = curr_quat
             return curr_pos, curr_quat
 
-        # Filter Position (Linear Interpolation)
-        filt_pos = self.alpha_pos * curr_pos + (1 - self.alpha_pos) * self.prev_pos
+        # 1. Calculate how fast the pose is changing (Euclidean distance)
+        dist = np.linalg.norm(curr_pos - self.prev_pos)
+        
+        # 2. Calculate dynamic alpha
+        # If dist is 0, alpha = min_alpha (smooth). 
+        # If dist > ramp_dist, alpha = max_alpha (responsive).
+        alpha = np.clip((dist / self.ramp_dist), self.min_alpha, self.max_alpha)
 
-        # Filter Rotation (Spherical Linear Interpolation - SLERP)
+        # 3. Position Filter (Linear Interpolation)
+        filt_pos = alpha * curr_pos + (1 - alpha) * self.prev_pos
+
+        # 4. Rotation Filter (SLERP)
+        # We blend the previous rotation to the current one based on alpha
         key_times = [0, 1]
         key_rots = R.from_quat([self.prev_quat, curr_quat])
         slerp = Slerp(key_times, key_rots)
-        
-        # Interpolate at time 1.0 using the alpha weight
-        interp_rot = slerp([self.alpha_rot]) 
+        interp_rot = slerp([alpha]) 
         filt_quat = interp_rot[0].as_quat()
 
-        # Update state
+        # Update State
         self.prev_pos = filt_pos
         self.prev_quat = filt_quat
         
         return filt_pos, filt_quat
 
 # ==========================================
-# 2. DEFAULT MARKER MAP
+# 2. BOARD CONFIGURATION
 # ==========================================
 
-DEFAULT_MARKER_MAP = {
-    28: [ 0.29, -0.49, 0.0],  # Top-Left
-    7:  [-0.29, -0.49, 0.0],  # Top-Right
-    19: [ 0.29,  0.49, 0.0],  # Bottom-Left
-    96: [-0.29,  0.49, 0.0]   # Bottom-Right
+X_OFF = 0.29
+Y_OFF = 0.49
+
+# Physical positions of marker centers relative to board center
+MARKER_POSITIONS = {
+    28: np.array([-X_OFF,  Y_OFF, 0], dtype=np.float32), # Top-Left
+    7:  np.array([ X_OFF,  Y_OFF, 0], dtype=np.float32), # Top-Right
+    19: np.array([-X_OFF, -Y_OFF, 0], dtype=np.float32), # Bottom-Left
+    96: np.array([ X_OFF, -Y_OFF, 0], dtype=np.float32)  # Bottom-Right
 }
 
 # ==========================================
 # 3. ROS 2 NODE
 # ==========================================
 
-class DockingPublisher(Node):
+class RobustDockingNode(Node):
     def __init__(self):
-        super().__init__('docking_publisher')
+        super().__init__('robust_docking_node')
         
         # --- Parameters ---
         self.declare_parameter('camera_frame', 'camera_optical_frame')
         self.declare_parameter('calibration_file', 'calibration_data.json')
         self.declare_parameter('marker_size', 0.15)
         self.declare_parameter('video_device', 0)
-        self.declare_parameter('enable_gui', True) # Set False for Headless Robot
-        self.declare_parameter('filter_alpha', 0.6) # 0.6 = moderate smoothing
+        self.declare_parameter('enable_gui', True) 
 
         self.camera_frame = self.get_parameter('camera_frame').value
         self.calib_file = self.get_parameter('calibration_file').value
         self.marker_size = self.get_parameter('marker_size').value
         self.video_device = self.get_parameter('video_device').value
         self.enable_gui = self.get_parameter('enable_gui').value
-        alpha = self.get_parameter('filter_alpha').value
 
-        # --- Initialization ---
+        # --- Setup ---
         self.mtx, self.dist = self.load_calibration(self.calib_file)
         self.aruco_dict = aruco.Dictionary_get(aruco.DICT_ARUCO_ORIGINAL)
         
-        # Configure Detector for Accuracy
+        # Detector Optimization: Faster Subpix refinement
         self.params = aruco.DetectorParameters_create()
         self.params.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
-        if hasattr(aruco, 'SOLVEPNP_IPPE_SQUARE'):
-            self.params.solvePnPMethod = aruco.SOLVEPNP_IPPE_SQUARE
+        self.params.cornerRefinementWinSize = 3 # Smaller window = Faster
+        self.params.cornerRefinementMaxIterations = 20
         
-        # Filter
-        self.filter = PoseFilter(alpha_pos=alpha, alpha_rot=alpha)
+        self.board = self.create_custom_board()
+        self.filter = AdaptivePoseFilter(min_alpha=0.1, max_alpha=0.9, ramp_dist=0.05)
+
+        # Tracking State
+        self.last_rvec = None
+        self.last_tvec = None
 
         # Camera Setup
         self.cap = cv2.VideoCapture(self.video_device)
@@ -107,26 +119,27 @@ class DockingPublisher(Node):
             self.get_logger().fatal(f"Failed to open device {self.video_device}")
             sys.exit(1)
             
-        # --- LATENCY OPTIMIZATION ---
+        # Hardware Latency Optimization
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1) 
 
-        # QoS for fast updates (Volatile)
-        qos_profile = QoSProfile(
+        # QoS for fast updates
+        qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             durability=DurabilityPolicy.VOLATILE,
             history=HistoryPolicy.KEEP_LAST,
             depth=1
         )
-        self.publisher_ = self.create_publisher(PoseStamped, 'dock_pose', qos_profile)
+        self.publisher_ = self.create_publisher(PoseStamped, 'dock_pose', qos)
 
-        self.timer = self.create_timer(0.03, self.timer_callback)
+        # Run at 30Hz
+        self.timer = self.create_timer(0.033, self.timer_callback)
         
-        self.get_logger().info(f"Docking Optimized. GUI: {self.enable_gui}, Alpha: {alpha}")
+        self.get_logger().info("Robust Board Tracker Initialized (Adaptive Filter Active)")
 
     def load_calibration(self, path):
         if not os.path.exists(path):
-            self.get_logger().fatal(f"Missing calibration: {path}")
+            self.get_logger().fatal(f"Calibration file not found: {path}")
             sys.exit(1)
         try:
             with open(path, 'r') as f:
@@ -138,65 +151,77 @@ class DockingPublisher(Node):
             self.get_logger().fatal(f"Calibration Error: {e}")
             sys.exit(1)
 
-    def get_center_from_marker(self, rvec, tvec, offset):
-        R_mat, _ = cv2.Rodrigues(rvec)
-        offset_world = np.dot(R_mat, np.array(offset))
-        return tvec.flatten() + offset_world
+    def create_custom_board(self):
+        obj_points = []
+        ids = []
+        half_s = self.marker_size / 2.0
+        
+        base_square = np.array([
+            [-half_s,  half_s, 0], 
+            [ half_s,  half_s, 0],
+            [ half_s, -half_s, 0],
+            [-half_s, -half_s, 0]
+        ], dtype=np.float32)
+
+        for marker_id, center_pos in MARKER_POSITIONS.items():
+            corners = base_square + center_pos
+            obj_points.append(corners)
+            ids.append(marker_id)
+
+        return aruco.Board_create(np.array(obj_points), self.aruco_dict, np.array(ids))
 
     def timer_callback(self):
+        # --- 1. BUFFER DRAIN (Latency Optimization) ---
+        # Grab frame repeatedly to ensure we have the absolute latest image
+        # This prevents the robot from reacting to what happened 200ms ago
         ret, frame = self.cap.read()
-        
-        if not ret:
-            return
+        if not ret: return
+
+        # Optional: aggressive drain if camera fps > processing fps
+        # while self.cap.grab():
+        #     ret, frame = self.cap.retrieve()
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         corners, ids, _ = aruco.detectMarkers(gray, self.aruco_dict, parameters=self.params)
 
         if ids is not None and len(ids) > 0:
             
-            # Use detected markers to estimate pose
-            rvecs, tvecs, _ = aruco.estimatePoseSingleMarkers(
-                corners, self.marker_size, self.mtx, self.dist
+            # --- 2. ROBUST ESTIMATION (With Stability Check) ---
+            # Use previous frame as guess to prevent axis flipping
+            use_guess = (self.last_rvec is not None)
+            
+            valid_markers, rvec, tvec = aruco.estimatePoseBoard(
+                corners, ids, self.board, self.mtx, self.dist, 
+                self.last_rvec, self.last_tvec, useExtrinsicGuess=use_guess
             )
 
-            # Find best marker (closest to center) and accumulate positions
-            center_points = []
-            best_rvec = None
-            min_dist = float('inf')
-            h, w = frame.shape[:2]
-            img_center = np.array([w/2, h/2])
+            if valid_markers > 0:
+                # --- 3. JUMP DETECTION (Anti-Teleport) ---
+                # If pose jumps > 0.4m instantly, it's likely a solver error. Reset.
+                if use_guess:
+                    jump_dist = np.linalg.norm(tvec.flatten() - self.last_tvec.flatten())
+                    if jump_dist > 0.4:
+                        self.get_logger().warn(f"Impossible jump detected ({jump_dist:.2f}m). Resetting solver.")
+                        self.last_rvec = None
+                        self.last_tvec = None
+                        return # Skip this bad frame
 
-            ids_flat = ids.flatten()
-            for i, marker_id in enumerate(ids_flat):
-                if marker_id in DEFAULT_MARKER_MAP:
-                    # Calculate world position
-                    center_pt = self.get_center_from_marker(
-                        rvecs[i], tvecs[i], DEFAULT_MARKER_MAP[marker_id]
-                    )
-                    center_points.append(center_pt)
+                # Update tracking
+                self.last_rvec = rvec.copy()
+                self.last_tvec = tvec.copy()
 
-                    # Orientation preference logic
-                    marker_center = corners[i][0].mean(axis=0)
-                    dist = np.linalg.norm(marker_center - img_center)
-                    if dist < min_dist:
-                        min_dist = dist
-                        best_rvec = rvecs[i]
+                # --- 4. PREPARE DATA ---
+                raw_pos = tvec.flatten()
+                rmat, _ = cv2.Rodrigues(rvec)
+                raw_quat = R.from_matrix(rmat).as_quat()
 
-            if center_points and best_rvec is not None:
-                # 1. Raw Calculation
-                raw_pos = np.mean(np.array(center_points), axis=0)
-                
-                rmat, _ = cv2.Rodrigues(best_rvec)
-                raw_quat = R.from_matrix(rmat).as_quat() # x, y, z, w
-
-                # 2. Filter (Smoothing)
+                # --- 5. ADAPTIVE FILTERING ---
                 filt_pos, filt_quat = self.filter.update(raw_pos, raw_quat)
 
-                # 3. Publish
+                # --- 6. PUBLISH ---
                 msg = PoseStamped()
                 msg.header.stamp = self.get_clock().now().to_msg()
                 msg.header.frame_id = self.camera_frame
-                
                 msg.pose.position.x = float(filt_pos[0])
                 msg.pose.position.y = float(filt_pos[1])
                 msg.pose.position.z = float(filt_pos[2])
@@ -204,26 +229,39 @@ class DockingPublisher(Node):
                 msg.pose.orientation.y = float(filt_quat[1])
                 msg.pose.orientation.z = float(filt_quat[2])
                 msg.pose.orientation.w = float(filt_quat[3])
-                
                 self.publisher_.publish(msg)
 
-                # 4. Visualization (Only if enabled)
+                # --- 7. VISUALIZATION ---
                 if self.enable_gui:
                     aruco.drawDetectedMarkers(frame, corners, ids)
-                    # Draw coordinate axis at the SMOOTHED center
-                    cv2.drawFrameAxes(frame, self.mtx, self.dist, best_rvec, filt_pos, 0.2)
                     
-                    # Project center to screen
-                    imgpts, _ = cv2.projectPoints(np.array([filt_pos]), np.zeros(3), np.zeros(3), self.mtx, self.dist)
-                    c_x, c_y = imgpts[0].ravel().astype(int)
-                    cv2.circle(frame, (c_x, c_y), 8, (0, 255, 0), -1) # Green dot = Filtered
+                    # Draw Board Axis
+                    cv2.drawFrameAxes(frame, self.mtx, self.dist, rvec, tvec, 0.2)
                     
-                    # Debug Info
-                    text = f"XYZ: {filt_pos[0]:.2f}, {filt_pos[1]:.2f}, {filt_pos[2]:.2f}"
-                    cv2.putText(frame, text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                    # Calculate Center Screen Point
+                    imgpts, _ = cv2.projectPoints(np.array([[0.0, 0.0, 0.0]]), rvec, tvec, self.mtx, self.dist)
+                    center_screen = tuple(imgpts[0].ravel().astype(int))
+                    
+                    # Draw Center Dot (Red)
+                    cv2.circle(frame, center_screen, 6, (0, 0, 255), -1)
+
+                    # Draw Yellow Lines (Individual Markers -> Board Center)
+                    for i, marker_id in enumerate(ids.flatten()):
+                        if marker_id in MARKER_POSITIONS:
+                            c_marker = tuple(corners[i][0].mean(axis=0).astype(int))
+                            cv2.line(frame, c_marker, center_screen, (0, 255, 255), 2)
+
+                    # Info Text
+                    text = f"X:{filt_pos[0]:.2f} Y:{filt_pos[1]:.2f} Z:{filt_pos[2]:.2f}"
+                    cv2.putText(frame, text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            else:
+                # Tracking lost this frame
+                self.last_rvec = None
+                self.last_tvec = None
 
         if self.enable_gui:
-            cv2.imshow('Optimized Docking', frame)
+            cv2.imshow('Robust Docking', frame)
             if cv2.waitKey(1) == 27:
                 rclpy.shutdown()
 
@@ -235,7 +273,7 @@ class DockingPublisher(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = DockingPublisher()
+    node = RobustDockingNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
