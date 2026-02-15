@@ -4,355 +4,371 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Pose
 from sensor_msgs.msg import Image
-from custom_msgs.msg import Telemetry  # Mira Stack Telemetry
+from custom_msgs.msg import Telemetry 
 from cv_bridge import CvBridge
 import cv2
+import cv2.aruco as aruco
 import numpy as np
 import time
+import json
+import os
+import sys
 import threading
+from collections import deque
 from ultralytics import YOLO
 from scipy.spatial.transform import Rotation as R
 from scipy.spatial.transform import Slerp
 
-# ================= CONFIGURATION =================
-# --- Hardware Maps ---
+# ================= USER CONFIGURATION =================
+
+# 1. HARDWARE
 CAM_ID_FRONT = 0
 CAM_ID_BOTTOM = 2
-CAM_WIDTH, CAM_HEIGHT = 640, 480
+DEFAULT_CALIB_FILE = "calibration_data.json"
 
-# --- Mira Topics ---
-TOPIC_PID_ERROR = '/control/pose_error'  # Mira PID Listener
-TOPIC_TELEMETRY = '/master/telemetry'    # Mira State Source
-TOPIC_DEBUG_FRONT = '/debug/front_cam'
-TOPIC_DEBUG_BOTTOM = '/debug/bottom_cam'
+# 2. FILTERING (Your Parameters)
+ALPHA_POS = 0.6      # Position Smoothing (0.6 = 60% New, 40% Old)
+ALPHA_ROT = 0.6      # Rotation Smoothing
+MAX_JUMP = 0.5       # Meters. Reject frames if jump > 0.5m
+MEDIAN_BUFFER = 3    # Buffer size for median filtering
 
-# --- Mission Parameters ---
-TARGET_CLASS = 0
-CONFIDENCE_THRESHOLD = 0.6
-ARUCO_SIZE = 0.20 # Meters
-PHASE_1_SURGE_TARGET = 0.85 # 85% width fill
-PHASE_2_DESCEND_TOLERANCE = 0.15 # 15cm alignment required to dive
+# 3. DOCKING BOARD SETUP (Your Map)
+# Format: ID: [Offset_X, Offset_Y, Offset_Z] (Meters from Center)
+MARKER_SIZE = 0.15   # Size of the black square (Meters)
+BOARD_MAP = {
+    28: [-0.29, -0.49, 0.0],  # Top-Left
+    7:  [ 0.29, -0.49, 0.0],  # Top-Right
+    19: [-0.29,  0.49, 0.0],  # Bot-Left
+    96: [ 0.29,  0.49, 0.0]   # Bot-Right
+}
 
-# --- AUV Physics Filters (The "SOTA" Part) ---
-# Underwater vehicles lag. We need slow filters.
-ALPHA_POS = 0.2      # Very smooth position (0.0=Frozen, 1.0=Raw)
-ALPHA_ROT = 0.1      # Very smooth rotation
-OUTLIER_DIST_M = 0.8 # Rejection gate (meters)
-COAST_TIME = 3.0     # Seconds to drift blindly before searching
+# 4. STRATEGY
+PHASE_1_SURGE_STOP = 0.85
+PHASE_2_ALIGN_DIST = 0.15
+HANDOVER_COAST_TIME = 2.5
 
-# --- Calibration (Replace with Mira's Calib) ---
-K_MATRIX = np.array([[600, 0, 320], [0, 600, 240], [0, 0, 1]], dtype=np.float32)
-DIST_COEFFS = np.zeros(5)
-
-# ================= HELPER CLASSES =================
-
-class ImageEnhancer:
-    """Enhances underwater images for better detection."""
+# ================= 1. SMART FILTER (Your Logic) =================
+class SmartPoseFilter:
     def __init__(self):
-        # CLAHE (Contrast Limited Adaptive Histogram Equalization)
-        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        self.alpha_pos = ALPHA_POS
+        self.alpha_rot = ALPHA_ROT
+        self.max_jump = MAX_JUMP
+        self.prev_pos = None
+        self.prev_quat = None
+        self.pos_buffer = deque(maxlen=MEDIAN_BUFFER)
+        self.consecutive_rejections = 0
+        self.max_rejections = 5 
 
-    def apply(self, frame):
-        # Convert to LAB color space
-        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
-        # Apply CLAHE to L-channel (Luminance)
-        cl = self.clahe.apply(l)
-        # Merge and convert back
-        limg = cv2.merge((cl, a, b))
-        return cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
+    def update(self, curr_pos, curr_quat):
+        if self.prev_pos is None:
+            self.prev_pos, self.prev_quat = curr_pos, curr_quat
+            return curr_pos, curr_quat
 
-class RobustStateEstimator:
-    """
-    Handles Sensor Fusion & Outlier Rejection for AUVs.
-    Uses LERP for Position, SLERP for Orientation.
-    """
-    def __init__(self):
-        self.initialized = False
-        self.pos = np.zeros(3) # x, y, z
-        self.rot = R.from_quat([0, 0, 0, 1]) 
-        self.outlier_count = 0
-    
-    def update(self, meas_pos, meas_yaw):
-        meas_rot = R.from_euler('z', meas_yaw, degrees=True)
+        # Jump Rejection
+        dist = np.linalg.norm(curr_pos - self.prev_pos)
+        if dist > self.max_jump and self.consecutive_rejections < self.max_rejections:
+            self.consecutive_rejections += 1
+            return None, None
         
-        if not self.initialized:
-            self.pos = meas_pos
-            self.rot = meas_rot
-            self.initialized = True
-            return self.pos, self.rot.as_euler('z', degrees=True)
-
-        # 1. Outlier Rejection (Teleportation Check)
-        dist = np.linalg.norm(meas_pos - self.pos)
-        if dist > OUTLIER_DIST_M:
-            self.outlier_count += 1
-            if self.outlier_count < 5: # Wait 5 frames to confirm it's real
-                return self.pos, self.rot.as_euler('z', degrees=True)
-            self.outlier_count = 0
+        self.consecutive_rejections = 0 # Reset if accepted
         
-        # 2. LERP Position
-        self.pos = (ALPHA_POS * meas_pos) + ((1 - ALPHA_POS) * self.pos)
+        # Median Stabilization
+        self.pos_buffer.append(curr_pos)
+        median_pos = np.median(np.array(self.pos_buffer), axis=0)
 
-        # 3. SLERP Rotation
-        key_rots = R.from_quat([self.rot.as_quat(), meas_rot.as_quat()])
-        slerp = Slerp([0, 1], key_rots)
-        self.rot = slerp(ALPHA_ROT)
+        # EMA Smoothing
+        filt_pos = self.alpha_pos * median_pos + (1 - self.alpha_pos) * self.prev_pos
 
-        return self.pos, self.rot.as_euler('z', degrees=True)
+        # SLERP Smoothing
+        try:
+            rots = R.from_quat([self.prev_quat, curr_quat])
+            slerp = Slerp([0, 1], rots)
+            filt_quat = slerp([self.alpha_rot])[0].as_quat()
+        except:
+            filt_quat = curr_quat
+
+        self.prev_pos, self.prev_quat = filt_pos, filt_quat
+        return filt_pos, filt_quat
 
     def reset(self):
-        self.initialized = False
+        self.prev_pos = None
+        self.pos_buffer.clear()
 
-class CameraThread:
-    """Prevents blocking the ROS loop with IO operations"""
+# ================= 2. UTILS & THREADING =================
+class AsyncCamera:
     def __init__(self, src):
         self.cap = cv2.VideoCapture(src)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self.ret, self.frame = self.cap.read()
         self.running = True
         self.lock = threading.Lock()
-        threading.Thread(target=self._update, daemon=True).start()
+        threading.Thread(target=self._loop, daemon=True).start()
 
-    def _update(self):
+    def _loop(self):
         while self.running:
             ret, frame = self.cap.read()
             if ret:
                 with self.lock:
                     self.ret, self.frame = ret, frame
-            time.sleep(0.015)
+            time.sleep(0.01)
 
-    def read(self):
+    def get(self):
         with self.lock:
             return self.frame.copy() if self.ret else None
 
-    def release(self):
-        self.running = False
-        self.cap.release()
+def load_calibration(path):
+    if not os.path.exists(path):
+        print(f"ERROR: Calibration file {path} not found! Using defaults.")
+        return np.array([[600,0,320],[0,600,240],[0,0,1]], dtype=float), np.zeros(5)
+    with open(path, 'r') as f:
+        data = json.load(f)
+    return np.array(data['camera_matrix'], dtype=np.float32), \
+           np.array(data['dist_coeff'], dtype=np.float32)
 
-# ================= MAIN NODE =================
+def generate_board_points():
+    """Generates the 3D coordinates for all corners of the marker board."""
+    pts = {}
+    s = MARKER_SIZE / 2.0
+    # Corners: TL, TR, BR, BL relative to marker center
+    base_corners = np.array([[-s, -s, 0], [s, -s, 0], [s, s, 0], [-s, s, 0]], dtype=np.float32)
+    
+    for mid, offset in BOARD_MAP.items():
+        # Add board offset to marker corners
+        pts[mid] = base_corners + np.array(offset, dtype=np.float32)
+    return pts
 
-class MiraDockingPlanner(Node):
+# ================= 3. MAIN NODE =================
+class RobustDockingNode(Node):
     def __init__(self):
-        super().__init__('mira_docking_planner')
+        super().__init__('robust_docking_node')
         
-        # 1. Communications
-        self.pub_error = self.create_publisher(Pose, TOPIC_PID_ERROR, 10)
-        self.pub_dbg_front = self.create_publisher(Image, TOPIC_DEBUG_FRONT, 10)
-        self.pub_dbg_bottom = self.create_publisher(Image, TOPIC_DEBUG_BOTTOM, 10)
+        # ROS Params & Topics
+        self.declare_parameter('calib_file', DEFAULT_CALIB_FILE)
+        calib_path = self.get_parameter('calib_file').value
         
-        self.sub_telem = self.create_subscription(
-            Telemetry, TOPIC_TELEMETRY, self.telemetry_cb, 10
-        )
+        self.pub_error = self.create_publisher(Pose, '/control/pose_error', 10)
+        self.pub_debug = self.create_publisher(Image, '/debug/perception', 10)
         self.bridge = CvBridge()
-
-        # 2. Modules
-        self.estimator = RobustStateEstimator()
-        self.enhancer = ImageEnhancer()
         
-        try:
-            # Enable tracking for ID persistence
-            self.yolo = YOLO("best.pt") 
-        except:
-            self.get_logger().error("YOLO 'best.pt' not found!")
+        # Load Calibration
+        self.mtx, self.dist = load_calibration(calib_path)
+        self.get_logger().info(f"Loaded Calibration: {calib_path}")
 
-        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
-        self.aruco_params = cv2.aruco.DetectorParameters()
-
-        # 3. State
+        # Vision Setup
+        self.cam_front = AsyncCamera(CAM_ID_FRONT)
+        self.cam_bottom = AsyncCamera(CAM_ID_BOTTOM)
+        
+        # Models & Detectors
+        self.yolo = YOLO("best.pt")
+        # Note: Using DICT_ARUCO_ORIGINAL as per your snippet
+        self.aruco_dict = aruco.Dictionary_get(aruco.DICT_ARUCO_ORIGINAL)
+        self.aruco_params = aruco.DetectorParameters_create()
+        self.aruco_params.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
+        
+        # Enhancement
+        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        
+        # Logic Components
+        self.board_pts_map = generate_board_points()
+        self.filter_front = SmartPoseFilter()
+        self.filter_bottom = SmartPoseFilter()
+        
         self.state = "SEARCH"
         self.last_sight_time = time.time()
-        self.current_depth = 0.0
-        self.current_yaw = 0.0
-
-        # 4. Hardware
-        self.cam_front = CameraThread(CAM_ID_FRONT)
-        self.cam_bottom = CameraThread(CAM_ID_BOTTOM)
-
-        # 5. Timer
-        self.create_timer(0.05, self.control_loop) # 20Hz Control Loop
-        self.get_logger().info("Mira Docking Node: OPERATIONAL")
-
-    def telemetry_cb(self, msg):
-        self.current_depth = msg.depth
-        self.current_yaw = msg.yaw
+        
+        # Start Loop
+        self.create_timer(0.05, self.control_loop)
+        self.get_logger().info("Robust Docking Node: READY")
 
     def control_loop(self):
-        # 1. Acquire & Enhance Frames
-        raw_f = self.cam_front.read()
-        raw_b = self.cam_bottom.read()
-        
-        if raw_f is None or raw_b is None: return
+        frame_f = self.cam_front.get()
+        frame_b = self.cam_bottom.get()
+        if frame_f is None or frame_b is None: return
 
-        frame_f = self.enhancer.apply(raw_f) # Apply Underwater filter
-        frame_b = self.enhancer.apply(raw_b)
+        # Enhance Bottom Cam (Underwater)
+        gray_b = cv2.cvtColor(frame_b, cv2.COLOR_BGR2GRAY)
+        gray_b = self.clahe.apply(gray_b)
 
-        # 2. Logic Pipeline (Priority: Bottom -> Front -> Coast -> Search)
+        # --- PHASE 2: BOTTOM CAM (MULTI-MARKER BOARD) ---
+        dock_pose = self.process_board(gray_b, frame_b)
         
-        # --- CHECK BOTTOM CAM (PHASE 2) ---
-        aruco_pose = self.process_aruco(frame_b)
-        
-        if aruco_pose is not None:
-            self.state = "PHASE_2_LOCK"
+        if dock_pose:
+            self.state = "DOCK_LOCKED"
             self.last_sight_time = time.time()
             
-            # Smooth the noisy raw pose
-            smooth_pos, smooth_yaw = self.estimator.update(aruco_pose[:3], aruco_pose[3])
+            raw_p, raw_q = dock_pose
+            final_p, final_q = self.filter_bottom.update(raw_p, raw_q)
             
-            # Execute descent logic
-            self.execute_docking(smooth_pos, smooth_yaw)
-            self.publish_debug(frame_f, frame_b)
-            return
+            if final_p is not None:
+                self.run_docking_logic(final_p, final_q)
+                self.publish_debug(frame_f, frame_b, final_p)
+                return
 
-        # --- CHECK FRONT CAM (PHASE 1) ---
-        yolo_target = self.process_yolo(frame_f)
-        
-        if yolo_target is not None:
-            self.state = "PHASE_1_APPROACH"
-            self.last_sight_time = time.time()
+        # --- PHASE 1: FRONT CAM (YOLO) ---
+        # If Bottom Cam lost/didn't find board, try Front Cam
+        if self.state != "DOCK_LOCKED":
+            appr_pose = self.process_yolo(frame_f)
             
-            # Convert YOLO bbox to "Pseudo-Pose" for the estimator
-            raw_pos, raw_yaw = self.yolo_to_pose(yolo_target, frame_f.shape)
-            
-            # Smooth it
-            smooth_pos, smooth_yaw = self.estimator.update(raw_pos, raw_yaw)
-            
-            self.publish_pid(smooth_pos[0], smooth_pos[1], 0.0, smooth_yaw) # Z=0 means hold depth
-            self.publish_debug(frame_f, frame_b)
-            return
+            if appr_pose:
+                self.state = "APPROACH"
+                self.last_sight_time = time.time()
+                
+                raw_p, raw_q = appr_pose
+                final_p, final_q = self.filter_front.update(raw_p, raw_q)
+                
+                if final_p is not None:
+                    # Hold Depth (Z=0) during Phase 1
+                    self.publish_cmd(final_p[0], final_p[1], 0.0, final_q)
+                    self.publish_debug(frame_f, frame_b, final_p)
+                    return
 
-        # --- LOST TARGET LOGIC ---
+        # --- FAILSAFE: COAST or SEARCH ---
         elapsed = time.time() - self.last_sight_time
-        
-        if elapsed < COAST_TIME:
-            # Coast Mode: Maintain last known vector (AUV Momentum)
-            # This bridges the gap between Front Cam loss and Bottom Cam acquisition
-            self.get_logger().info(f"Coasting... {elapsed:.1f}s")
-            # Send small forward surge to ensure we cross over the marker
-            self.publish_pid(0.3, 0.0, 0.0, 0.0) 
+        if elapsed < HANDOVER_COAST_TIME:
+            self.state = "COASTING"
+            # Blindly push forward to bridge the camera gap
+            self.publish_cmd(0.3, 0.0, 0.0, [0,0,0,1])
         else:
-            # Search Mode: Spin
             self.state = "SEARCH"
-            self.estimator.reset()
-            self.publish_pid(0.0, 0.0, 0.0, 10.0) # 10 deg/s yaw
+            self.filter_front.reset()
+            self.filter_bottom.reset()
+            # Spin
+            spin_q = R.from_euler('z', 15, degrees=True).as_quat()
+            self.publish_cmd(0.0, 0.0, 0.0, spin_q)
 
-        self.publish_debug(frame_f, frame_b)
+        self.publish_debug(frame_f, frame_b, [0,0,0])
 
-    def process_aruco(self, frame):
-        """Returns [Surge, Sway, Depth, Yaw] or None"""
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        corners, ids, _ = cv2.aruco.detectMarkers(gray, self.aruco_dict, parameters=self.aruco_params)
-
+    # ================= ALGORITHMS =================
+    
+    def process_board(self, gray, debug_frame):
+        """
+        Robustly solves Pose using multiple markers. 
+        Returns (pos, quat) of the BOARD CENTER.
+        """
+        corners, ids, _ = aruco.detectMarkers(gray, self.aruco_dict, parameters=self.aruco_params)
+        
         if ids is None: return None
-
-        cv2.aruco.drawDetectedMarkers(frame, corners, ids)
-        rvec, tvec, _ = cv2.aruco.estimatePoseSingleMarkers(corners[0], ARUCO_SIZE, K_MATRIX, DIST_COEFFS)
-        cv2.drawFrameAxes(frame, K_MATRIX, DIST_COEFFS, rvec, tvec, 0.1)
-
-        # --- NED TRANSFORM FOR MIRA ---
-        # Cam Frame: X=Right, Y=Down, Z=Forward
-        # Mira Body: X=Surge(Fwd), Y=Sway(Right), Z=Heave(Down)
         
-        # Bottom Cam (Looking Down):
-        # Cam Z = Depth Distance (Heave Error)
-        # Cam X = Body Sway (Right) -> +X in Cam is +Y in Body
-        # Cam Y = Body Surge (Backwards) -> +Y in Cam is -X in Body
+        obj_points = []
+        img_points = []
         
-        tx, ty, tz = tvec[0][0]
+        # Match detected IDs to our Board Map
+        aruco.drawDetectedMarkers(debug_frame, corners, ids)
         
-        surge_err = -ty 
-        sway_err = tx   
-        heave_err = tz  
+        ids_flat = ids.flatten()
+        for i, mid in enumerate(ids_flat):
+            if mid in self.board_pts_map:
+                # Add the 4 corners of this marker from 3D Map
+                obj_points.extend(self.board_pts_map[mid])
+                # Add the 4 corners of this marker from 2D Image
+                img_points.extend(corners[i][0])
         
-        # Yaw: Simple Heading alignment
-        yaw_err = np.degrees(np.arctan2(tx, ty)) * 1.5
-
-        return np.array([surge_err, sway_err, heave_err, yaw_err])
+        if len(obj_points) < 4: return None # Need at least 1 full marker
+        
+        # solvePnP on the aggregate cloud of points
+        # This gives the pose of the CAMERA relative to the BOARD CENTER (0,0,0)
+        success, rvec, tvec = cv2.solvePnP(
+            np.array(obj_points), np.array(img_points), self.mtx, self.dist
+        )
+        
+        if not success: return None
+        
+        cv2.drawFrameAxes(debug_frame, self.mtx, self.dist, rvec, tvec, 0.2)
+        
+        # --- COORDINATE TRANSFORM (Crucial) ---
+        # tvec is Camera's position in Board Frame 
+        # Actually solvePnP gives Object in Camera Frame.
+        # Cam: X=Right, Y=Down, Z=Fwd
+        # Body: X=Fwd, Y=Right, Z=Down
+        
+        cx, cy, cz = tvec.flatten()
+        
+        # Map to Body Errors
+        # If board is at [0,0,5] in Cam (Z=5), Body Heave Error is 5.
+        # If board is at [1,0,0] in Cam (X=1, Right), Body Sway Error is 1.
+        # If board is at [0,-1,0] in Cam (Y=-1, Top), Body Surge Error is 1 (Forward).
+        
+        surge = -cy
+        sway = cx
+        heave = cz
+        
+        # Yaw
+        # Simple heading alignment
+        yaw = np.degrees(np.arctan2(sway, surge)) * 1.5
+        q = R.from_euler('z', yaw, degrees=True).as_quat()
+        
+        return np.array([surge, sway, heave]), q
 
     def process_yolo(self, frame):
-        # Use track=True for temporal consistency
-        results = self.yolo.track(frame, persist=True, verbose=False, conf=CONFIDENCE_THRESHOLD)
-        
+        """Standard Phase 1 Approach"""
+        results = self.yolo(frame, verbose=False, stream=True)
+        target = None
         for r in results:
             for box in r.boxes:
-                if int(box.cls[0]) == TARGET_CLASS:
-                    # Draw for debug
-                    x,y,w,h = box.xywh[0].cpu().numpy()
-                    cv2.rectangle(frame, (int(x-w/2), int(y-h/2)), (int(x+w/2), int(y+h/2)), (0,255,0), 2)
-                    return box.xywh[0].cpu().numpy()
-        return None
-
-    def yolo_to_pose(self, bbox, shape):
-        cx, cy, w, h = bbox
-        img_h, img_w, _ = shape
-
-        # Normalize Errors
-        # X Error (Sway): Center of box vs Center of Image
-        # -1 (Left) to +1 (Right)
+                if int(box.cls[0]) == 0:
+                    target = box.xywh[0].cpu().numpy()
+                    break
+        
+        if target is None: return None
+        
+        cx, cy, w, h = target
+        img_w = float(frame.shape[1])
+        
         norm_x = (cx - (img_w/2)) / (img_w/2)
+        width_ratio = w / img_w
         
-        # Surge: Based on size. If small, surge 1.0. If big, surge 0.0.
-        size_ratio = w / img_w
-        surge_cmd = 1.0 if size_ratio < PHASE_1_SURGE_TARGET else 0.0
+        surge = 0.8 if width_ratio < PHASE_1_SURGE_STOP else 0.0
+        sway = norm_x * 2.0
+        yaw = norm_x * 35.0
+        
+        q = R.from_euler('z', yaw, degrees=True).as_quat()
+        return np.array([surge, sway, 0.0]), q
 
-        # Create specific gains for AUV
-        sway_cmd = norm_x * 2.0 
-        yaw_cmd = norm_x * 35.0 # Turn into the sway
-        
-        return np.array([surge_cmd, sway_cmd, 0.0]), yaw_cmd
-
-    def execute_docking(self, pos, yaw):
-        surge, sway, depth = pos
-        
+    def run_docking_logic(self, pos, quat):
+        surge, sway, heave = pos
         planar_err = np.sqrt(surge**2 + sway**2)
         
         z_cmd = 0.0
-        
-        # Safety: Only descend if we are stable over the marker
-        if planar_err < PHASE_2_DESCEND_TOLERANCE:
-            if depth > 0.35: # Don't crash into the floor
-                z_cmd = depth # Request PID to go down by this amount
+        if planar_err < PHASE_2_ALIGN_DIST:
+            if heave > 0.30: # Stop height
+                z_cmd = heave
             else:
                 self.state = "DOCKED"
-                z_cmd = 0.0
         
-        self.publish_pid(surge, sway, z_cmd, yaw)
+        self.publish_cmd(surge, sway, z_cmd, quat)
 
-    def publish_pid(self, x, y, z, yaw_deg):
-        """Publishes to Mira's control topic"""
+    def publish_cmd(self, x, y, z, q):
         msg = Pose()
         msg.position.x = float(x)
         msg.position.y = float(y)
         msg.position.z = float(z)
-        
-        q = R.from_euler('z', yaw_deg, degrees=True).as_quat()
-        msg.orientation.x = q[0]
-        msg.orientation.y = q[1]
-        msg.orientation.z = q[2]
-        msg.orientation.w = q[3]
-        
+        msg.orientation.x = float(q[0])
+        msg.orientation.y = float(q[1])
+        msg.orientation.z = float(q[2])
+        msg.orientation.w = float(q[3])
         self.pub_error.publish(msg)
 
-    def publish_debug(self, frame_f, frame_b):
-        cv2.putText(frame_f, f"State: {self.state}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,255), 2)
+    def publish_debug(self, front, bottom, cmd):
+        if front.shape != bottom.shape:
+            bottom = cv2.resize(bottom, (front.shape[1], front.shape[0]))
+        combo = np.hstack((front, bottom))
+        cv2.putText(combo, f"ST:{self.state} X:{cmd[0]:.2f} Y:{cmd[1]:.2f}", 
+                   (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
         try:
-            self.pub_dbg_front.publish(self.bridge.cv2_to_imgmsg(frame_f, "bgr8"))
-            self.pub_dbg_bottom.publish(self.bridge.cv2_to_imgmsg(frame_b, "bgr8"))
+            self.pub_debug.publish(self.bridge.cv2_to_imgmsg(combo, "bgr8"))
         except: pass
-
-    def destroy_node(self):
-        self.cam_front.release()
-        self.cam_bottom.release()
-        super().destroy_node()
 
 def main(args=None):
     rclpy.init(args=args)
-    node = MiraDockingPlanner()
+    node = RobustDockingNode()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
+        node.cam_front.running = False
+        node.cam_bottom.running = False
         node.destroy_node()
         rclpy.shutdown()
 
