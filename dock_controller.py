@@ -50,7 +50,7 @@ qos_profile = QoSProfile(
     history=HistoryPolicy.KEEP_LAST,
     depth=10
 )
-self.create_subscription(PoseStamped, "/perception/dock_pose", self.pose_callback, qos_profile)
+self.create_subscription(PoseStamped, "dock_pose", self.pose_callback, qos_profile)
         self.create_subscription(Telemetry, "/master/telemetry", self.telem_callback, 10)
 
         # Main Control Loop (20Hz)
@@ -114,13 +114,12 @@ self.create_subscription(PoseStamped, "/perception/dock_pose", self.pose_callbac
         elif self.state == State.ALIGN_XY:
             # Phase 2: Alignment
             if not self.dock_visible:
-                self.state = State.SEARCH # Lost it, go back
+                self.state = State.SEARCH #Lost it,go back
                 return
 
             # PID Control
             err_sway = self.target_pose['x']
             # Note: For Surge in this phase, we want to maintain a specific distance 
-            # OR just align XY before moving closer. Let's align XY while slowly creeping.
             
             cmd.lateral = self.apply_pid(err_sway, self.kp_sway)
             cmd.forward = 1500 # Very slow approach while aligning
@@ -135,9 +134,7 @@ self.create_subscription(PoseStamped, "/perception/dock_pose", self.pose_callbac
             if not self.dock_visible:
                 self.state = State.SEARCH
                 return
-
             err_yaw = self.target_pose['yaw']
-            
             # Simple P-Controller for Yaw
             # Note: 1500 + output. Positive output = Clockwise usually.
             cmd.yaw = self.apply_pid(err_yaw, self.kp_yaw)
