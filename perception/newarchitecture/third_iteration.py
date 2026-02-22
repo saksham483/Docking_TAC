@@ -26,13 +26,13 @@ CAM_ID_FRONT = 0
 CAM_ID_BOTTOM = 2
 DEFAULT_CALIB_FILE = "calibration_data.json"
 
-# 2. FILTERING (Your Parameters)
+# 2. FILTERING
 ALPHA_POS = 0.6      # Position Smoothing (0.6 = 60% New, 40% Old)
 ALPHA_ROT = 0.6      # Rotation Smoothing
 MAX_JUMP = 0.5       # Meters. Reject frames if jump > 0.5m
 MEDIAN_BUFFER = 3    # Buffer size for median filtering
 
-# 3. DOCKING BOARD SETUP (Your Map)
+# 3. DOCKING BOARD SETUP
 # Format: ID: [Offset_X, Offset_Y, Offset_Z] (Meters from Center)
 MARKER_SIZE = 0.15   # Size of the black square (Meters)
 BOARD_MAP = {
@@ -47,7 +47,7 @@ PHASE_1_SURGE_STOP = 0.85
 PHASE_2_ALIGN_DIST = 0.15
 HANDOVER_COAST_TIME = 2.5
 
-# ================= 1. SMART FILTER (Your Logic) =================
+# ================= 1. SMART FILTER  =================
 class SmartPoseFilter:
     def __init__(self):
         self.alpha_pos = ALPHA_POS
@@ -276,9 +276,8 @@ class RobustDockingNode(Node):
         
         cv2.drawFrameAxes(debug_frame, self.mtx, self.dist, rvec, tvec, 0.2)
         
-        # --- COORDINATE TRANSFORM (Crucial) ---
+        # --- COORDINATE TRANSFORM  ---
         # tvec is Camera's position in Board Frame 
-        # Actually solvePnP gives Object in Camera Frame.
         # Cam: X=Right, Y=Down, Z=Fwd
         # Body: X=Fwd, Y=Right, Z=Down
         
